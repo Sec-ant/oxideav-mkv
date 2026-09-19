@@ -1,5 +1,7 @@
 # oxideav-mkv
 
+The Sec-ant fork supports selective track reading through `set_active_streams` and indexed subtitle extraction through `indexed_subtitle_packets`. Selected reads seek over inactive Block payloads. Whole-Cluster CRC reporting applies to full-stream reads. Subtitle indexing checks unique Block locations, packet times, durations, and payload bytes against Cues and the muxer's track statistics; absent or inconsistent metadata uses sequential extraction. Completeness relies on the muxer's `NUMBER_OF_FRAMES` and `NUMBER_OF_BYTES` tags. Cargo can use the fork through a Git dependency on https://github.com/Sec-ant/oxideav-mkv.
+
 [![CI](https://github.com/OxideAV/oxideav-mkv/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mkv/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mkv.svg)](https://crates.io/crates/oxideav-mkv) [![docs.rs](https://docs.rs/oxideav-mkv/badge.svg)](https://docs.rs/oxideav-mkv) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Pure-Rust **Matroska (MKV)** and **WebM** container — demuxer + muxer

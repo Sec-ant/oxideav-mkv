@@ -1056,6 +1056,7 @@ fn open_typed_impl(
         input,
         ebml_header,
         streams,
+        active_streams: None,
         track_index_by_number,
         track_number_by_index,
         segment_data_start,
@@ -2142,6 +2143,11 @@ fn validate_top_level_crc(
         return Ok(None);
     }
     r.seek(SeekFrom::Start(body_start))?;
+    let leading = read_element_header(r);
+    r.seek(SeekFrom::Start(body_start))?;
+    if !matches!(leading, Ok(ref e) if e.id == ids::CRC32 && e.size == 4) {
+        return Ok(None);
+    }
     let body = read_bytes(r, len as usize)?;
     // Always rewind for the caller before returning, regardless of outcome.
     r.seek(SeekFrom::Start(body_start))?;
@@ -8698,6 +8704,7 @@ pub struct MkvDemuxer {
     /// and any `DocTypeExtension` declarations. See [`MkvDemuxer::ebml_header`].
     ebml_header: EbmlHeader,
     streams: Vec<StreamInfo>,
+    active_streams: Option<Vec<bool>>,
     track_index_by_number: std::collections::HashMap<u64, u32>,
     /// Reverse of `track_index_by_number`: stream index → MKV TrackNumber.
     track_number_by_index: Vec<u64>,
@@ -8976,6 +8983,18 @@ impl Demuxer for MkvDemuxer {
         &self.streams
     }
 
+    fn set_active_streams(&mut self, indices: &[u32]) {
+        self.active_streams = Some(
+            (0..self.streams.len())
+                .map(|i| indices.contains(&(i as u32)))
+                .collect(),
+        );
+        if let Some(active) = &self.active_streams {
+            self.out_queue
+                .retain(|q| active.get(q.packet.stream_index as usize) == Some(&true));
+        }
+    }
+
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
             if let Some(q) = self.out_queue.pop_front() {
@@ -9178,6 +9197,140 @@ impl Demuxer for MkvDemuxer {
 }
 
 impl MkvDemuxer {
+    /// Read subtitle packets using Cues and muxer track statistics.
+    ///
+    /// Unique Block count, payload bytes, CueTime, and CueDuration are checked.
+    /// Completeness relies on the muxer's NUMBER_OF_FRAMES and NUMBER_OF_BYTES
+    /// tags. Inconsistent or absent metadata returns None for sequential reading.
+    /// Reader position and packet selection are preserved.
+    pub fn indexed_subtitle_packets(&mut self, stream_index: u32) -> Result<Option<Vec<Packet>>> {
+        let Some(stream) = self.streams.get(stream_index as usize) else {
+            return Ok(None);
+        };
+        if stream.params.media_type != MediaType::Subtitle || self.apply_track_operations {
+            return Ok(None);
+        }
+        let statistic = |name: &str| -> Option<u64> {
+            let key = format!("tag:track:{stream_index}:{name}");
+            let mut values = self.metadata.iter().filter(|(k, _)| k == &key);
+            let value = values.next()?.1.parse().ok()?;
+            if values.next().is_some() {
+                return None;
+            }
+            Some(value)
+        };
+        let (Some(count), Some(bytes)) =
+            (statistic("number_of_frames"), statistic("number_of_bytes"))
+        else {
+            return Ok(None);
+        };
+        if count == 0 || count > 1_000_000 || bytes > 64 * 1024 * 1024 {
+            return Ok(None);
+        }
+        let track = self.track_number_by_index[stream_index as usize];
+        let mut entries = Vec::new();
+        let mut positions = std::collections::HashSet::new();
+        for point in &self.cue_points {
+            for pos in point.track_positions.iter().filter(|p| p.track == track) {
+                let (Some(cluster), Some(relative), Some(duration)) =
+                    (pos.cluster_position, pos.relative_position, pos.duration)
+                else {
+                    return Ok(None);
+                };
+                if duration == 0
+                    || pos.codec_state != 0
+                    || !pos.references.is_empty()
+                    || !positions.insert((cluster, relative))
+                {
+                    return Ok(None);
+                }
+                entries.push((cluster, relative, point.time, duration));
+            }
+        }
+        if entries.len() as u64 != count {
+            return Ok(None);
+        }
+        entries.sort_unstable();
+        let original_position = self.input.stream_position()?;
+        let original_queue = std::mem::take(&mut self.out_queue);
+        let original_active = self.active_streams.take();
+        self.set_active_streams(&[stream_index]);
+        let result = (|| -> Result<Option<Vec<Packet>>> {
+            let mut output = Vec::with_capacity(entries.len());
+            let mut total = 0u64;
+            let mut previous_cluster = None;
+            let mut bounds = (0, 0, 0);
+            for (cluster, relative, time, duration) in entries {
+                if previous_cluster != Some(cluster) {
+                    let Some(absolute) = self.segment_data_start.checked_add(cluster) else {
+                        return Ok(None);
+                    };
+                    match self.probe_cue_target(absolute)? {
+                        CueProbe::Cluster {
+                            body_start,
+                            declared_end: Some(end),
+                            timestamp: Some(timestamp),
+                        } if end <= self.segment_data_end && timestamp <= i64::MAX as u64 => {
+                            bounds = (body_start, end, timestamp as i64);
+                        }
+                        _ => return Ok(None),
+                    }
+                    previous_cluster = Some(cluster);
+                }
+                let (start, end, timestamp) = bounds;
+                let Some(target) = start.checked_add(relative).filter(|p| *p < end) else {
+                    return Ok(None);
+                };
+                self.input.seek(SeekFrom::Start(target))?;
+                let element = read_element_header(&mut *self.input)?;
+                if element.size > 64 * 1024 * 1024 {
+                    return Ok(None);
+                }
+                let Some(block_end) = self
+                    .input
+                    .stream_position()?
+                    .checked_add(element.size)
+                    .filter(|p| *p <= end)
+                else {
+                    return Ok(None);
+                };
+                match element.id {
+                    ids::BLOCK_GROUP => self.parse_block_group(block_end, timestamp)?,
+                    ids::SIMPLE_BLOCK => {
+                        if let Some(data) = self.read_active_block(element.size)? {
+                            self.queue_block_packets(&data, timestamp, false)?;
+                        }
+                    }
+                    _ => return Ok(None),
+                }
+                if self.out_queue.len() != 1 {
+                    return Ok(None);
+                }
+                let packet = self.out_queue.pop_front().unwrap().packet;
+                if packet.stream_index != stream_index
+                    || packet.pts != i64::try_from(time).ok()
+                    || packet.duration != i64::try_from(duration).ok()
+                {
+                    return Ok(None);
+                }
+                total = total.saturating_add(packet.data.len() as u64);
+                if total > bytes {
+                    return Ok(None);
+                }
+                output.push(packet);
+            }
+            Ok((total == bytes).then_some(output))
+        })();
+        self.out_queue = original_queue;
+        self.active_streams = original_active;
+        self.input.seek(SeekFrom::Start(original_position))?;
+        match result {
+            Err(Error::InvalidData(_) | Error::Unsupported(_) | Error::Eof) => Ok(None),
+            Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            other => other,
+        }
+    }
+
     /// Typed `Tags\Tag` collection (RFC 9559 §5.1.8.1) parsed from the
     /// Segment, with every `Targets\Tag*UID` already resolved against the
     /// Segment's track / edition / chapter / attachment tables.
@@ -10866,6 +11019,11 @@ impl MkvDemuxer {
         body_end: u64,
         is_unknown_size: bool,
     ) -> Result<()> {
+        // A track selection reads only the requested payloads. Whole-Cluster
+        // CRC reporting accompanies full-stream reads.
+        if self.active_streams.is_some() {
+            return Ok(());
+        }
         if body_end <= body_start {
             return Ok(());
         }
@@ -11285,8 +11443,9 @@ impl MkvDemuxer {
                         self.push_cluster_encrypted_block(body_start, bytes);
                     }
                     ids::SIMPLE_BLOCK => {
-                        let bytes = read_bytes(&mut *self.input, e.size as usize)?;
-                        self.queue_block_packets(&bytes, cluster_timecode, false)?;
+                        if let Some(bytes) = self.read_active_block(e.size)? {
+                            self.queue_block_packets(&bytes, cluster_timecode, false)?;
+                        }
                     }
                     ids::BLOCK_GROUP => {
                         let bg_end = self.input.stream_position()?.saturating_add(e.size);
@@ -11314,6 +11473,45 @@ impl MkvDemuxer {
         }
     }
 
+    fn stream_is_active(&self, index: u32) -> bool {
+        self.active_streams
+            .as_ref()
+            .map_or(true, |active| active.get(index as usize) == Some(&true))
+    }
+
+    fn read_active_block(&mut self, size: u64) -> Result<Option<Vec<u8>>> {
+        let start = self.input.stream_position()?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| Error::invalid("MKV: Block size overflow"))?;
+        if self.active_streams.is_some() {
+            let (track, width) = read_vint(&mut *self.input, false)?;
+            if size < width as u64 + 3 {
+                return Err(Error::invalid("MKV: truncated Block header"));
+            }
+            let needed = self
+                .track_index_by_number
+                .get(&track)
+                .is_some_and(|&index| {
+                    self.stream_is_active(index)
+                        || (self.apply_track_operations
+                            && self.virtual_consumers.get(index as usize).is_some_and(
+                                |consumers| {
+                                    consumers
+                                        .iter()
+                                        .any(|origin| self.stream_is_active(origin.virtual_stream))
+                                },
+                            ))
+                });
+            if !needed {
+                self.input.seek(SeekFrom::Start(end))?;
+                return Ok(None);
+            }
+            self.input.seek(SeekFrom::Start(start))?;
+        }
+        Ok(Some(read_bytes(&mut *self.input, size as usize)?))
+    }
+
     fn parse_block_group(&mut self, end: u64, cluster_timecode: i64) -> Result<()> {
         let mut block_bytes: Option<Vec<u8>> = None;
         let mut duration: Option<i64> = None;
@@ -11322,9 +11520,17 @@ impl MkvDemuxer {
         let mut meta = BlockGroupMeta::default();
         while self.input.stream_position()? < end {
             let e = read_element_header(&mut *self.input)?;
+            let position = self.input.stream_position()?;
+            if position > end || e.size > end - position {
+                return Err(Error::invalid("MKV: BlockGroup child exceeds its parent"));
+            }
             match e.id {
                 ids::BLOCK => {
-                    block_bytes = Some(read_bytes(&mut *self.input, e.size as usize)?);
+                    block_bytes = self.read_active_block(e.size)?;
+                    if block_bytes.is_none() {
+                        self.input.seek(SeekFrom::Start(end))?;
+                        return Ok(());
+                    }
                 }
                 ids::BLOCK_DURATION => {
                     duration = Some(read_uint(&mut *self.input, e.size as usize)? as i64);
@@ -11509,6 +11715,7 @@ impl MkvDemuxer {
                     .map(Vec::as_slice)
                     .unwrap_or(&[])
                     .iter()
+                    .filter(|origin| self.stream_is_active(origin.virtual_stream))
                     .map(|&origin| {
                         let mut vp = pkt.clone();
                         vp.stream_index = origin.virtual_stream;
@@ -11523,12 +11730,14 @@ impl MkvDemuxer {
             } else {
                 Vec::new()
             };
-            self.out_queue.push_back(QueuedPacket {
-                packet: pkt,
-                additions: additions.clone(),
-                meta: meta.clone(),
-                origin: None,
-            });
+            if self.stream_is_active(stream_idx) {
+                self.out_queue.push_back(QueuedPacket {
+                    packet: pkt,
+                    additions: additions.clone(),
+                    meta: meta.clone(),
+                    origin: None,
+                });
+            }
             self.out_queue.extend(synth);
         }
         Ok(())

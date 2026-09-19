@@ -246,6 +246,22 @@ fn application_is_off_by_default() {
     );
 }
 
+#[test]
+fn selecting_a_virtual_track_keeps_its_source_blocks() {
+    let mut dmx = open(join_file());
+    dmx.set_apply_track_operations(true);
+    dmx.set_active_streams(&[2]);
+    let packets = drain(&mut dmx);
+    assert_eq!(packets.len(), 5);
+    assert!(packets
+        .iter()
+        .all(|(p, origin)| p.stream_index == 2 && origin.is_some()));
+    assert_eq!(
+        packets.iter().map(|(p, _)| p.data[0]).collect::<Vec<_>>(),
+        vec![0x10, 0x20, 0x11, 0x21, 0x12]
+    );
+}
+
 /// TrackJoinBlocks application: the virtual stream carries every source
 /// Block, in storage order, with bytes / timestamps / keyframe flags
 /// preserved, and each synthesised packet reports its provenance.
