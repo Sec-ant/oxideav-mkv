@@ -294,7 +294,7 @@ fn roundtrip_other_forward_compat_variants() {
                 comp_step(0, 0x1, ContentCompAlgo::Other(42), vec![0x09]),
                 enc_step(
                     1,
-                    0x2,
+                    0x1,
                     ContentEncAlgo::Other(99),
                     Vec::new(),
                     // Other(7) on a non-AES algo would be rejected; but the

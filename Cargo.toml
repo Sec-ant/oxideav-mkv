@@ -15,6 +15,7 @@ categories = ["multimedia::video", "parser-implementations"]
 
 [dependencies]
 oxideav-core = "0.1"
+flate2 = "1"
 
 [dev-dependencies]
 oxideav-basic = "0.0"

@@ -693,12 +693,10 @@ fn private_scope_header_stripping_does_not_touch_packets() {
     assert_eq!(pkt.data, frame, "Private-scope strip leaves frames alone");
 }
 
-/// When the Block-scoped chain contains a step the container can't reverse
-/// (here an AES encryption alongside a Header-Stripping), the demuxer must
-/// NOT partially undo it — packets pass through as the encoded bytes so the
-/// caller can apply the whole chain itself.
+/// A chain containing unsupported encryption must fail explicitly before
+/// publishing any packet, while its track metadata remains inspectable.
 #[test]
-fn unsupported_step_in_chain_leaves_packets_encoded() {
+fn unsupported_step_in_chain_rejects_encoded_packets() {
     let on_disk = [0x55, 0x66];
     let mut body = Vec::new();
     // order 0: header-strip (reversible); order 1: AES encryption (not).
@@ -718,9 +716,8 @@ fn unsupported_step_in_chain_leaves_packets_encoded() {
 
     // Sanity: the AES encoding is Block-scoped by default (scope omitted → 0x1).
     let mut dmx = open(assemble_with_cluster(&tracks_body, &cluster_with(&on_disk)));
-    let pkt = dmx.next_packet().expect("packet");
-    assert_eq!(
-        pkt.data, on_disk,
-        "encrypted chain → packet left untouched, not partially stripped"
-    );
+    assert_eq!(dmx.content_encodings(0).unwrap().encodings.len(), 2);
+    let error = dmx.next_packet().unwrap_err();
+    assert!(matches!(error, oxideav_core::Error::Unsupported(_)));
+    assert!(error.to_string().contains("encrypted Matroska content"));
 }

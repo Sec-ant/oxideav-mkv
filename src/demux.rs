@@ -535,7 +535,12 @@ fn open_typed_impl(
     let mut streams: Vec<StreamInfo> = Vec::new();
     let mut track_index_by_number: std::collections::HashMap<u64, u32> =
         std::collections::HashMap::new();
-    for t in &tracks {
+    for t in &mut tracks {
+        // CodecPrivate must be restored before resolving CodecID wrappers and
+        // codec-specific configuration (RFC 9559 §5.1.4.1.31.3, scope 0x2).
+        if let Some(encodings) = &t.content_encodings {
+            encodings.restore(&mut t.codec_private, ContentEncodingScope(2))?;
+        }
         let idx = streams.len() as u32;
         track_index_by_number.insert(t.number, idx);
         // Ask the CodecResolver registry first (codec crates can claim
@@ -1014,20 +1019,6 @@ fn open_typed_impl(
         })
         .collect();
 
-    // Per-stream Header-Stripping prefix (RFC 9559 §5.1.4.1.31.6 algo 3): the
-    // bytes to prepend to each de-laced frame to undo a Block-scoped
-    // Header-Stripping chain. Empty when there's nothing to undo or the chain
-    // contains a step the container can't reverse — see
-    // `compute_header_strip_prefix`.
-    let header_strip_prefixes: Vec<Vec<u8>> = content_encodings
-        .iter()
-        .map(|ce| {
-            ce.as_ref()
-                .and_then(compute_header_strip_prefix)
-                .unwrap_or_default()
-        })
-        .collect();
-
     // Position at the first Cluster. The schema gives `Cluster` no
     // `minOccurs`, so a Segment with zero Clusters — a metadata-only
     // file carrying just Info / Tracks / Chapters / Tags / Attachments —
@@ -1081,7 +1072,6 @@ fn open_typed_impl(
         virtual_consumers,
         last_virtual_origin: None,
         content_encodings,
-        header_strip_prefixes,
         video_interlacings,
         video_geometries,
         video_colours,
@@ -6020,11 +6010,10 @@ impl MasteringMetadata {
 /// transformations applied to the track's frame data and/or `CodecPrivate`
 /// before the bytes were written into Blocks.
 ///
-/// This is purely the *description* of how a track's data was encoded — the
-/// container does not decompress or decrypt anything. A reader that wants
-/// the raw codec bytes back must undo the encodings itself, in the order
-/// the spec defines: highest [`ContentEncoding::order`] first, lowest last
-/// (§5.1.4.1.31.2).
+/// The demuxer restores zlib and header stripping for Block frame data and
+/// CodecPrivate. Other compression, encryption, and next-encoding scopes
+/// fail explicitly when their data is consumed. The typed metadata remains
+/// available for inspection.
 ///
 /// `encodings` is returned sorted by descending `order` so iterating it
 /// front-to-back is the spec-mandated *decode* order.
@@ -6042,60 +6031,92 @@ impl ContentEncodings {
     pub fn is_empty(&self) -> bool {
         self.encodings.is_empty()
     }
-}
 
-/// Compute the byte prefix to prepend to every de-laced frame in order to
-/// undo a track's Block-scoped Header-Stripping compression (RFC 9559
-/// §5.1.4.1.31.6 algo 3, §5.1.4.1.31.7).
-///
-/// Header Stripping is the only [`ContentEncoding`] transform the container
-/// can reverse without a compression/encryption codec: the
-/// `ContentCompSettings` bytes were removed from the front of each frame on
-/// write, so prepending them restores the original frame.
-///
-/// The full chain is undone highest-`ContentEncodingOrder` first
-/// (§5.1.4.1.31.2). `enc.encodings` is already pre-sorted into that decode
-/// order, so iterating it front-to-back and prepending each step's stripped
-/// bytes ahead of the bytes accumulated so far yields the correct combined
-/// prefix.
-///
-/// This only fires when *every* Block-scoped (`ContentEncodingScope` bit
-/// `0x1`) encoding is Header Stripping. If any Block-scoped step is a
-/// different compression (zlib / bzlib / lzo1x) or an encryption, the
-/// container cannot reconstruct the raw bytes and returns `None` — the
-/// caller must undo the whole chain itself and the demuxer leaves packets
-/// encoded. Non-Block-scoped encodings (e.g. `CodecPrivate`-only, scope
-/// `0x2`) are ignored here since they never touch frame data.
-fn compute_header_strip_prefix(enc: &ContentEncodings) -> Option<Vec<u8>> {
-    let mut prefix: Vec<u8> = Vec::new();
-    let mut saw_strip = false;
-    for e in &enc.encodings {
-        if !e.scope.block() {
-            // Doesn't touch Block frame data — irrelevant to packet bytes.
-            continue;
+    /// Undo supported content transformations in decode order. No encoding
+    /// means no allocation or copy. Each restored frame/config is capped at
+    /// 16 MiB, independently of compressed input size.
+    fn restore(&self, data: &mut Vec<u8>, scope: ContentEncodingScope) -> Result<()> {
+        const LIMIT: usize = 16 * 1024 * 1024;
+        // A private-only restoration does not consume unrelated packet data.
+        if scope.private() && !self.encodings.iter().any(|e| e.scope.private()) {
+            return Ok(());
         }
-        match &e.transform {
-            ContentEncodingTransform::Compression {
-                algo: ContentCompAlgo::HeaderStripping,
-                settings,
-            } => {
-                // Decode order: this (higher-order) step is undone before the
-                // ones already accumulated, so its bytes go in front.
-                let mut combined = settings.clone();
-                combined.extend_from_slice(&prefix);
-                prefix = combined;
-                saw_strip = true;
+        for encoding in &self.encodings {
+            if encoding.scope.next() || encoding.scope.0 & !7 != 0 {
+                return Err(Error::unsupported(format!(
+                    "Matroska content encoding scope {} is not supported",
+                    encoding.scope.0
+                )));
             }
-            // Any other Block-scoped transform (real compression or
-            // encryption) is something the container can't undo — bail so the
-            // whole chain is left to the caller rather than corrupting frames.
-            _ => return None,
+            if encoding.scope.0 & scope.0 == 0 {
+                continue;
+            }
+            match &encoding.transform {
+                ContentEncodingTransform::Compression {
+                    algo: ContentCompAlgo::HeaderStripping,
+                    settings,
+                } => {
+                    if settings.len().saturating_add(data.len()) > LIMIT {
+                        return Err(Error::invalid(
+                            "Matroska content exceeds the 16 MiB decoded packet limit",
+                        ));
+                    }
+                    data.splice(..0, settings.iter().copied());
+                }
+                ContentEncodingTransform::Compression {
+                    algo: ContentCompAlgo::Zlib,
+                    ..
+                } => {
+                    let mut decoder = flate2::Decompress::new(true);
+                    let mut decoded =
+                        Vec::with_capacity(data.len().saturating_mul(2).clamp(4096, LIMIT + 1));
+                    loop {
+                        let before = (decoder.total_in(), decoder.total_out());
+                        let status = decoder
+                            .decompress_vec(
+                                &data[decoder.total_in() as usize..],
+                                &mut decoded,
+                                flate2::FlushDecompress::None,
+                            )
+                            .map_err(|e| {
+                                Error::invalid(format!("decompressing Matroska zlib content: {e}"))
+                            })?;
+                        if decoded.len() > LIMIT {
+                            return Err(Error::invalid(
+                                "Matroska content exceeds the 16 MiB decoded packet limit",
+                            ));
+                        }
+                        if status == flate2::Status::StreamEnd {
+                            if decoder.total_in() as usize != data.len() {
+                                return Err(Error::invalid(
+                                    "Matroska zlib content has trailing bytes",
+                                ));
+                            }
+                            *data = decoded;
+                            break;
+                        }
+                        if before == (decoder.total_in(), decoder.total_out()) {
+                            return Err(Error::invalid("Matroska zlib content is truncated"));
+                        }
+                        if decoded.len() == decoded.capacity() {
+                            let capacity = (decoded.capacity() * 2).min(LIMIT + 1);
+                            decoded.reserve_exact(capacity - decoded.len());
+                        }
+                    }
+                }
+                ContentEncodingTransform::Compression { algo, .. } => {
+                    return Err(Error::unsupported(format!(
+                        "Matroska content compression {algo:?} is not supported"
+                    )));
+                }
+                ContentEncodingTransform::Encryption { .. } => {
+                    return Err(Error::unsupported(
+                        "encrypted Matroska content is not supported",
+                    ));
+                }
+            }
         }
-    }
-    if saw_strip {
-        Some(prefix)
-    } else {
-        None
+        Ok(())
     }
 }
 
@@ -8801,16 +8822,6 @@ pub struct MkvDemuxer {
     /// stream index. `None` for tracks with no encodings — see
     /// [`MkvDemuxer::content_encodings`].
     content_encodings: Vec<Option<ContentEncodings>>,
-    /// Per-stream Header-Stripping prefix (RFC 9559 §5.1.4.1.31.6 algo 3,
-    /// §5.1.4.1.31.7), indexed by stream index. When a track's *entire*
-    /// Block-scoped `ContentEncodings` chain is composed only of
-    /// Header-Stripping compressions, this holds the bytes to prepend to
-    /// every de-laced frame so emitted packets carry the original frame
-    /// data. Empty `Vec` when there is nothing to prepend (the common case,
-    /// or when the chain contains a step this container can't undo — zlib /
-    /// encryption — in which case packets pass through encoded). See
-    /// [`compute_header_strip_prefix`].
-    header_strip_prefixes: Vec<Vec<u8>>,
     /// Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 +
     /// §5.1.4.1.28.2), indexed by stream index. `None` for non-video tracks
     /// and for video tracks whose `TrackEntry` carried no `Video` master —
@@ -9210,6 +9221,10 @@ impl MkvDemuxer {
         if stream.params.media_type != MediaType::Subtitle || self.apply_track_operations {
             return Ok(None);
         }
+        // PGS packets are display-state changes, including explicit clears.
+        // They commonly have no BlockDuration/CueDuration; completeness still
+        // requires every unique Cue, exact timestamp, and all restored bytes.
+        let state_changes = stream.params.codec_id.as_str() == "hdmv_pgs_subtitle";
         let statistic = |name: &str| -> Option<u64> {
             let key = format!("tag:track:{stream_index}:{name}");
             let mut values = self.metadata.iter().filter(|(k, _)| k == &key);
@@ -9232,18 +9247,26 @@ impl MkvDemuxer {
         let mut positions = std::collections::HashSet::new();
         for point in &self.cue_points {
             for pos in point.track_positions.iter().filter(|p| p.track == track) {
-                let (Some(cluster), Some(relative), Some(duration)) =
-                    (pos.cluster_position, pos.relative_position, pos.duration)
+                let (Some(cluster), Some(relative)) = (pos.cluster_position, pos.relative_position)
                 else {
                     return Ok(None);
                 };
-                if duration == 0
+                let duration = pos.duration;
+                if (!state_changes && duration.is_none())
+                    || duration == Some(0)
                     || pos.codec_state != 0
                     || !pos.references.is_empty()
                     || !positions.insert((cluster, relative))
                 {
                     return Ok(None);
                 }
+                let duration = match duration {
+                    Some(value) => match i64::try_from(value) {
+                        Ok(value) => Some(value),
+                        Err(_) => return Ok(None),
+                    },
+                    None => None,
+                };
                 entries.push((cluster, relative, point.time, duration));
             }
         }
@@ -9309,7 +9332,7 @@ impl MkvDemuxer {
                 let packet = self.out_queue.pop_front().unwrap().packet;
                 if packet.stream_index != stream_index
                     || packet.pts != i64::try_from(time).ok()
-                    || packet.duration != i64::try_from(duration).ok()
+                    || packet.duration != duration
                 {
                     return Ok(None);
                 }
@@ -10485,13 +10508,11 @@ impl MkvDemuxer {
     ///
     /// A track's `ContentEncodings` describes the chain of transformations —
     /// compression and/or encryption — that were applied to its frame data
-    /// and/or `CodecPrivate` before the bytes were written into Blocks. The
-    /// container surfaces these *headers* only: it never decompresses or
-    /// decrypts a frame. A caller that wants the raw codec bytes back must
-    /// undo each [`ContentEncoding`] itself, iterating
-    /// [`ContentEncodings::encodings`] front-to-back (the demuxer pre-sorts
-    /// it into decode order — highest `ContentEncodingOrder` first, per
-    /// §5.1.4.1.31.2).
+    /// and/or `CodecPrivate` before the bytes were written into Blocks.
+    /// Supported zlib/header-stripping transforms are restored before codec
+    /// resolution and frame publication. Callers must not apply them again.
+    /// Unsupported transforms fail when their data is consumed. The returned
+    /// metadata remains sorted in decode order (highest order first).
     ///
     /// Returns `None` for an out-of-range `stream_index`.
     pub fn content_encodings(&self, stream_index: u32) -> Option<&ContentEncodings> {
@@ -11667,27 +11688,17 @@ impl MkvDemuxer {
         let pts_base = cluster_timecode + timecode_offset;
         let n_frames = frames.len() as i64;
         let per_frame = explicit_duration.map(|d| d / n_frames.max(1));
-        // Header-Stripping (RFC 9559 §5.1.4.1.31.6 algo 3) prefix for this
-        // stream, prepended to each de-laced frame so the packet carries the
-        // original (un-stripped) bytes. Block scope (§5.1.4.1.31.3 bit 0x1) is
-        // "all frame contents, excluding lacing data" — i.e. each frame after
-        // lacing is split, which is exactly `f` here. Empty when the track has
-        // no reversible Header-Stripping chain (the common case).
-        let strip_prefix = self
-            .header_strip_prefixes
+        // Restore each de-laced frame once, shared by sequential, seek, and
+        // verified-index reads. Lacing headers are outside the encoded scope.
+        let encodings = self
+            .content_encodings
             .get(stream_idx as usize)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        for (i, f) in frames.into_iter().enumerate() {
+            .and_then(Option::as_ref);
+        for (i, mut frame_bytes) in frames.into_iter().enumerate() {
             let pts = pts_base + per_frame.unwrap_or(0) * i as i64;
-            let frame_bytes = if strip_prefix.is_empty() {
-                f
-            } else {
-                let mut restored = Vec::with_capacity(strip_prefix.len() + f.len());
-                restored.extend_from_slice(strip_prefix);
-                restored.extend_from_slice(&f);
-                restored
-            };
+            if let Some(encodings) = encodings {
+                encodings.restore(&mut frame_bytes, ContentEncodingScope(1))?;
+            }
             let mut pkt = Packet::new(stream_idx, self.time_base, frame_bytes);
             pkt.pts = Some(pts);
             pkt.dts = Some(pts);
